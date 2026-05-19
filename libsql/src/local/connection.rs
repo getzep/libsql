@@ -106,8 +106,15 @@ impl Connection {
 
     /// Disconnect from the database.
     pub fn disconnect(&mut self) {
-        if Arc::get_mut(&mut self.drop_ref).is_some() {
+        // Idempotent: `LibsqlConnection::drop` calls this explicitly and the
+        // implicit field-drop of `local::Connection` calls it again on the
+        // same instance. Without the null-out, both calls satisfy
+        // `Arc::get_mut` and `sqlite3_close_v2` runs twice on the same `raw`
+        // -- a UAF that crashes when the allocator munmaps the arena between
+        // the two calls. See issues #419, #2040.
+        if !self.raw.is_null() && Arc::get_mut(&mut self.drop_ref).is_some() {
             unsafe { libsql_sys::ffi::sqlite3_close_v2(self.raw) };
+            self.raw = std::ptr::null_mut();
         }
     }
 
@@ -904,5 +911,22 @@ mod tests {
             let reserved = conn.get_reserved_bytes().unwrap();
             assert_eq!(reserved, reserved_bytes);
         }
+    }
+
+    #[test]
+    fn disconnect_is_idempotent() {
+        // Regression: `LibsqlConnection::drop` calls `disconnect` explicitly
+        // and the field auto-drop calls it again. The second call must not
+        // re-enter `sqlite3_close_v2` on a freed handle.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("idempotent.db");
+        let db = Database::new(db_path.to_str().unwrap().to_string(), OpenFlags::default());
+        let mut conn = Connection::connect(&db).unwrap();
+
+        conn.disconnect();
+        assert!(conn.handle().is_null(), "raw handle should be cleared after close");
+
+        // Second call would have been a UAF before this fix; now a no-op.
+        conn.disconnect();
     }
 }
